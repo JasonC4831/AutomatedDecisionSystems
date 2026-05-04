@@ -37,7 +37,7 @@
           engine_1 = RiskManagementSystem(portfolio=portfolio_1, currencies=['USD', 'EUR'], total_value=250000)
           engine_1.generate_heatmap()
         * Output for Test Portfolio 1:
-            *   Fetching historical data and FX rates...
+            -   Fetching historical data and FX rates...
 
                 ============================================================
                 RISK METHODOLOGY SUMMARY
@@ -95,7 +95,7 @@
           engine_2 = RiskManagementSystem(portfolio=portfolio_2, currencies=['USD'], total_value=250000)
           engine_2.generate_heatmap(print_explanation=False)
         * Output for Test Portfolio 2:
-            *   Fetching historical data and FX rates...
+            -   Fetching historical data and FX rates...
 
                 ============================================================
                 PORTFOLIO RISK STATE: RED
@@ -127,7 +127,7 @@
           engine_3 = RiskManagementSystem(portfolio=portfolio_3, currencies=['USD'], total_value=250000)
           engine_3.generate_heatmap(print_explanation=False)
         * Output for Test Portfolio 3:
-            *   Fetching historical data and FX rates...
+            -   Fetching historical data and FX rates...
 
                 ============================================================
                 PORTFOLIO RISK STATE: RED
