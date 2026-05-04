@@ -6,26 +6,35 @@ import datetime
 import random
 
 class RiskManagementSystem:
-    def __init__(self, portfolio, currencies=['USD'], total_value=100000, threshold=10):
+    def __init__(self, portfolio, currencies=['USD'], total_value=100000, 
+                 VaR_threshold=0.10, small_cap_threshold=0.30, fx_threshold=0.40):
         """
-        currencies: list of 'accepted' currencies. 
-                    currencies[0] is the Base Currency for conversion.
+        portfolio: dict mapping ticker to (weight, currency)
+        total_value: Total USD value of the portfolio
+        VaR_threshold: 5-Day VaR decimal threshold (e.g., 0.10 for 10%)
+        small_cap_threshold: Limit for small-cap concentration (default 0.30)
+        fx_threshold: Limit for unheld currency concentration (default 0.40)
         """
         self.portfolio = portfolio
         self.currencies = currencies 
         self.base_currency = currencies[0] 
+        self.total_value = total_value
+        
+        # Renamed and standardized thresholds
+        self.VaR_threshold = VaR_threshold 
+        self.small_cap_threshold = small_cap_threshold
+        self.fx_threshold = fx_threshold
+        
         self.unheld_currencies = [
             val[1] for val in portfolio.values() 
             if val[1] not in self.currencies
         ]
         
-        self.total_value = total_value
-        self.threshold = threshold
         self.tickers = list(portfolio.keys())
         self.weights = np.array([val[0] for val in portfolio.values()])
         self.data = None
         self.returns = None
-        self.fx_analysis = {}
+        self._metadata_cache = None
 
     def fetch_and_adjust_data(self):
         """
@@ -33,53 +42,53 @@ class RiskManagementSystem:
         to account for Foreign Exchange (FX) risk.
         """
         print("Fetching historical data and FX rates...")
-
         end = datetime.date.today()
         start = end - datetime.timedelta(days=730)
         
-        # 1. Identify which stocks need conversion
-        # Only convert if the stock currency is NOT in 'domestic' currencies list
         to_convert = {t: self.portfolio[t][1] for t in self.tickers 
                       if self.portfolio[t][1] not in self.currencies}
         
-        # 2. Identify required FX pairs to get back to Base Currency
-        # e.g., If Base is USD and stock is BRL, we need BRLUSD=X
         fx_tickers = [f"{c}{self.base_currency}=X" for c in set(to_convert.values())]
+        all_tickers = self.tickers + fx_tickers + ['^GSPC'] # Added Market Proxy here
         
-        all_tickers = self.tickers + fx_tickers
         t = Ticker(all_tickers)
         hist = t.history(start=start.isoformat(), end=end.isoformat())
         
         prices = hist.reset_index().pivot(index='date', columns='symbol', values='adjclose')
-        prices = prices.dropna(axis=1, how='all').ffill()
+        prices = prices.ffill().dropna(axis=0, how='all')
 
-        # 3. Apply Conditional FX Conversion
+        # Apply FX Conversion
         for ticker in self.tickers:
             asset_curr = self.portfolio[ticker][1]
-            
             if asset_curr not in self.currencies:
-                # Convert to the first currency in the array
                 fx_pair = f"{asset_curr}{self.base_currency}=X"
                 if fx_pair in prices.columns:
                     prices[ticker] = prices[ticker] * prices[fx_pair]
 
         self.data = prices[self.tickers]
+        self.market_data = prices['^GSPC'] # Cached for stress_test
         self.returns = self.data.pct_change().dropna()
         return self.returns
     
     def _get_asset_metadata(self):
         """
-        Calculates pure FX volatility vs. Stock volatility.
+        Fetches metadata for stocks once and caches it.
         """
+        if self._metadata_cache is not None:
+            return self._metadata_cache
+
         metadata = {}
+        # Fetch all tickers in one batch call to be efficient
+        t_info = Ticker(self.tickers).summary_detail
+        
         for ticker in self.tickers:
-            # Expert Rule: Use market cap to determine 'Spectrum'
-            info = Ticker(ticker).summary_detail.get(ticker, {})
-            m_cap = info.get('marketCap', 0)
+            # Handle potential dictionary nesting from yahooquery
+            info = t_info.get(ticker, {}) if isinstance(t_info, dict) else {}
+            m_cap = info.get('marketCap', 0) if isinstance(info, dict) else 0
             
-            if m_cap >= 10e9: # > $10B
+            if m_cap >= 10e9:
                 cap_size = 'Large'
-            elif m_cap >= 2e9: # $2B - $10B
+            elif m_cap >= 2e9:
                 cap_size = 'Mid'
             else:
                 cap_size = 'Small'
@@ -88,6 +97,8 @@ class RiskManagementSystem:
                 'cap_size': cap_size,
                 'currency': self.portfolio[ticker][1]
             }
+        
+        self._metadata_cache = metadata
         return metadata
 
     def isolate_fx_risk(self):
@@ -162,11 +173,11 @@ class RiskManagementSystem:
     def perform_scenario_analysis(self):
         """
         Applies historical shocks and dynamic FX crash scenarios 
-        for every international currency present in the portfolio.
+        including both USD and Percentage loss impacts.
         """
         scenarios = {
             "2020 Covid Crash": (-0.30, "A 30% sudden market deleveraging event."),
-            "High Inflation/Rate Hike": (-0.15, "15% drop due to discount rate adjustments.")
+            "High Inflation/Rate Hike": (-0.15, "15% market drop due to discount rate adjustments.")
         }
         
         results = {}
@@ -174,18 +185,29 @@ class RiskManagementSystem:
         
         # 1. Market Scenarios
         for name, (shock, desc) in scenarios.items():
-            impact = self.total_value * (shock * beta)
-            results[name] = {"loss": impact, "description": desc}
+            # Percentage impact on the total portfolio
+            total_impact_pct = shock * beta 
+            impact_usd = self.total_value * total_impact_pct
+            
+            results[name] = {
+                "loss": impact_usd, 
+                "loss_pct": total_impact_pct * 100,
+                "description": desc
+            }
         
         # 2. Dynamic FX Scenarios
         fx_shock_magnitude = -0.20 
         for curr in set(self.unheld_currencies):
             curr_weight = sum(val[0] for val in self.portfolio.values() if val[1] == curr)
-            fx_impact = self.total_value * curr_weight * fx_shock_magnitude
+            
+            # Percentage impact on the total portfolio
+            fx_impact_pct = curr_weight * fx_shock_magnitude
+            fx_impact_usd = self.total_value * fx_impact_pct
             
             scenario_name = f"{curr} Depreciation vs {self.base_currency}"
             results[scenario_name] = {
-                "loss": fx_impact,
+                "loss": fx_impact_usd,
+                "loss_pct": fx_impact_pct * 100,
                 "description": f"Simulates a {abs(fx_shock_magnitude)*100:.0f}% drop in {curr} (Unheld)."
             }
         
@@ -195,30 +217,29 @@ class RiskManagementSystem:
         """ 
         Returns (color, trace, rule_id) for the highest priority risk.
         """
-        # candidates: list of (score, message, rule_id)
         candidates = []
-        
-        metrics = self.calculate_var()
+        metrics = self.calculate_var() # Returns pct (e.g., 12.0)
         metadata = self._get_asset_metadata()
         
-        # Rule 1: Absolute VaR (Priority 3/1)
-        if metrics['5d_var_pct'] > self.threshold:
-            candidates.append((3, f"RED: 5-day VaR ({metrics['5d_var_pct']:.1f}%) exceeds threshold.", "VAR_CRITICAL"))
-        elif metrics['5d_var_pct'] > self.threshold / 2:
-            candidates.append((1, f"YELLOW: 5-day VaR is elevated at {metrics['5d_var_pct']:.1f}%.", "VAR_ELEVATED"))
+        # Convert decimal threshold to percentage for metric comparison
+        var_limit_pct = self.VaR_threshold * 100
+        
+        # Rule 1: Absolute VaR using the new parameter name
+        if metrics['5d_var_pct'] > var_limit_pct:
+            candidates.append((3, f"ALERT: 5-day VaR ({metrics['5d_var_pct']:.1f}%) exceeds threshold ({var_limit_pct:.1f}%).", "VAR_CRITICAL"))
+        elif metrics['5d_var_pct'] > (var_limit_pct / 2):
+            candidates.append((1, f"ALERT: 5-day VaR is elevated at {metrics['5d_var_pct']:.1f}%.", "VAR_ELEVATED"))
 
-        # Rule 2: Small-Cap (Priority 2)
+        # Rule 2: Small-Cap Concentration
         small_cap_weight = sum(self.portfolio[t][0] for t in self.tickers if metadata[t]['cap_size'] == 'Small')
-        if small_cap_weight > 0.30:
-            candidates.append((2, f"RED: Small-Cap exposure is {small_cap_weight*100:.1f}%, exceeding 30% threshold.", "SMALL_CAP_CONCENTRATION"))
+        if small_cap_weight > self.small_cap_threshold:
+            candidates.append((2, f"ALERT: Small-Cap exposure is {small_cap_weight*100:.1f}%, exceeding {self.small_cap_threshold*100:.0f}% limit.", "SMALL_CAP_CONCENTRATION"))
 
-        # Rule 3: Unheld Currency (Priority 2/1)
+        # Rule 3: FX Concentration
         for curr in set(self.unheld_currencies):
             curr_weight = sum(val[0] for t, val in self.portfolio.items() if val[1] == curr)
-            if curr_weight > 0.40:
-                candidates.append((2, f"RED: Extreme exposure to unheld currency {curr} ({curr_weight*100:.1f}%).", f"FX_RED_{curr}"))
-            elif curr_weight > 0.20:
-                candidates.append((1, f"YELLOW: High exposure to unheld currency {curr} ({curr_weight*100:.1f}%).", f"FX_YELLOW_{curr}"))
+            if curr_weight > self.fx_threshold:
+                candidates.append((2, f"ALERT: Exposure to {curr} ({curr_weight*100:.1f}%) exceeds {self.fx_threshold*100:.0f}% limit.", f"FX_RED_{curr}"))
 
         if not candidates:
             return "GREEN", ["GREEN: All metrics acceptable."], "LOW_RISK"
@@ -226,42 +247,41 @@ class RiskManagementSystem:
         candidates.sort(key=lambda x: x[0], reverse=True)
         top_score, top_message, rule_id = candidates[0]
         
-        color_map = {0: "GREEN", 1: "YELLOW", 2: "RED", 3: "RED"}
+        color_map = {1: "YELLOW", 2: "RED", 3: "RED"}
         return color_map.get(top_score, "RED"), [top_message], rule_id
 
     def stress_test(self):
         """
         Applies historical and prospective shocks to the portfolio.
         """
-        # Scenario 1: Historical - "Black Monday" equivalent (assume -10% market drop)
-        # We estimate shock impact by multiplying market drop by portfolio Beta
         port_returns = self.returns.dot(self.weights)
-        market_proxy = Ticker('^GSPC').history(period='2y')['adjclose'].pct_change().dropna()
+        market_rets = self.market_data.pct_change().reindex(port_returns.index).fillna(0)
         
-        # Align indices to calculate Beta
-        aligned = pd.concat([port_returns, market_proxy.xs('^GSPC', level=0)], axis=1).dropna()
-        cov = np.cov(aligned.iloc[:, 0], aligned.iloc[:, 1])[0, 1]
-        market_var = np.var(aligned.iloc[:, 1])
-        beta = cov / market_var if market_var > 0 else 1.0
+        # Calculate Beta correctly
+        covariance = np.cov(port_returns, market_rets)[0, 1]
+        market_variance = np.var(market_rets)
+        beta = covariance / market_variance if market_variance > 0 else 1.0
 
-        prospective_shock_pct = 0.15 # Scenario: Tech/Market drops 15%
+        prospective_shock_pct = 0.15 
         shock_loss_usd = self.total_value * (prospective_shock_pct * beta)
 
         return {'beta': beta, 'scenario_15_pct_crash_usd': shock_loss_usd}
 
     def risk_mitigation(self, rule_id):
         """
-        Identifies the highest risk contributor and suggests a hedge.
+        Identifies the highest risk contributor and provides a detailed strategy
+        including an explanation of Percentage Contribution to Risk (PCR).
         """
         if rule_id == "LOW_RISK" or not rule_id:
-            return None, "No changes required."
+            return None, "No changes required. Portfolio remains within risk thresholds."
 
         culprit = None
         advice = ""
         metadata = self._get_asset_metadata()
 
-        # 1. VAR RULES: PCR Logic
+        # 1. VAR RULES: PCR Logic and Explanation
         if rule_id in ["VAR_CRITICAL", "VAR_ELEVATED"]:
+            # Recalculate PCR
             cov_matrix = self.returns.cov()
             port_variance = np.dot(self.weights.T, np.dot(cov_matrix, self.weights))
             port_vol = np.sqrt(port_variance)
@@ -271,47 +291,48 @@ class RiskManagementSystem:
             highest_pcr_idx = np.argmax(pcr)
             culprit = self.tickers[highest_pcr_idx]
             culprit_pcr_pct = pcr[highest_pcr_idx] * 100
-            advice = (f"STRATEGY: DIVERSIFICATION. {culprit} dominates {culprit_pcr_pct:.1f}% of "
-                      f"your total portfolio risk. Reduce this position and rotate funds into assets with lower correlation such as US Treasuries or Gold to lower VaR.")
-
-        # 2. SMALL-CAP RULE: Now with Random Large-Cap Reallocation
-        elif rule_id == "SMALL_CAP_CONCENTRATION":
-            # Identify the Small-Cap culprit
-            small_caps = {t: self.portfolio[t][0] for t in self.tickers 
-                        if metadata[t]['cap_size'] == 'Small'}
-            culprit = max(small_caps, key=small_caps.get)
             
-            # Find potential Large-Cap targets
+            advice = (f"STRATEGY: DIVERSIFICATION. {culprit} currently accounts for {culprit_pcr_pct:.1f}% of "
+                      f"your total portfolio risk. This is measured via Percentage Contribution to Risk (PCR), \n"
+                      f"which calculates how much of the portfolio's total volatility is owned by a single asset, "
+                      f"accounting for its size, individual volatility, and correlation with other holdings. \n"
+                      f"Reduce this position size and rotate funds "
+                      f"into low-beta assets like US Treasuries or Gold to rebalance the risk distribution.")
+
+        # 2. SMALL-CAP RULE (Explanation remains the same)
+        elif rule_id == "SMALL_CAP_CONCENTRATION":
+            small_caps = {t: self.portfolio[t][0] for t in self.tickers 
+                          if metadata[t]['cap_size'] == 'Small'}
+            culprit = max(small_caps, key=small_caps.get)
             large_caps = [t for t in self.tickers if metadata[t]['cap_size'] == 'Large']
             
+            header = (f"STRATEGY: REALLOCATION. Small-cap exposure exceeds the 30% safety threshold. "
+                      f"Small-cap stocks are more sensitive to interest rate cycles and lack the capital \n"
+                      f"depth of larger firms, often leading to liquidity traps during market panics.")
+
             if large_caps:
                 target_stock = random.choice(large_caps)
-                advice = (f"STRATEGY: REALLOCATION. Portfolio is overly concentrated in small-cap stocks. "
-                        f"Small-cap stocks are generally more volatile than large-cap stocks. "
-                        f"In the event of a market crash, small cap stocks often lose liquidity first, which could make it difficult to exit positions. "
-                        f"Trim positions in the small cap stock {culprit} and reallocate funds into {target_stock} "
-                        f"to stabilize the portfolio.")
+                advice = (f"{header} Trim {culprit} and reallocate funds into {target_stock} to anchor "
+                          f"the portfolio with large-cap stability.")
             else:
-                # Fallback if the user somehow has no large caps
-                advice = (f"STRATEGY: REALLOCATION. Portfolio is overly concentrated in small-cap stocks. "
-                        f"Small-cap stocks are generally more volatile than large-cap stocks. In the event of a market crash, "
-                        f"small caps often lose liquidity first, which could make it difficult to exit positions. Trim positions in the small cap stock {culprit}. Since no Large-Caps exist "
-                        f"in your current portfolio, consider opening a new position in a large-cap (Blue Chip) stock.")
+                advice = (f"{header} Trim {culprit}. As your portfolio currently lacks Large-Cap assets, "
+                          f"consider initiating a position in a Blue Chip stock.")
 
-        # 3. FX RULES
+        # 3. FX RULES (Explanation remains the same)
         elif "FX_" in rule_id:
             curr = rule_id.split('_')[-1]
             fx_stocks = {t: self.portfolio[t][0] for t in self.tickers if self.portfolio[t][1] == curr}
             culprit = max(fx_stocks, key=fx_stocks.get)
-            advice = (f"STRATEGY: CURRENCY HEDGE. Having a high concentration in {curr} stocks, especially with {curr} not being a held currency, means "
-                      f"a localized crisis like a regional war or central bank policy shift could wipe out portfolio gains regardless of how well the individual companies are performing. "
-                      f"Hedge {culprit}'s currency risk with a {curr}/USD Forward or Future.")
+            
+            advice = (f"STRATEGY: CURRENCY HEDGE. High concentration in {curr} assets presents translation risk. "
+                      f"A drop in the value of the {curr} relative to {self.base_currency} will decrease your \n"
+                      f"total returns regardless of stock performance. Use a {curr}/USD Forward to hedge {culprit}.")
         
         return culprit, advice
 
-    def generate_heatmap(self):
+    def generate_heatmap(self, print_explanation=True):
         """
-        Orchestrates the risk report generation.
+        Orchestrates the risk report generation with percentage-based stress testing.
         """
         # 1. Data and Diagnostics
         self.fetch_and_adjust_data()
@@ -324,44 +345,58 @@ class RiskManagementSystem:
         # 3. Evaluation (Primary Risk Engine)
         color, trace, rule_id = self.evaluate_risk_state()
 
-        # 4. Output Logic
+         # 4. Explainability
+        if print_explanation:
+            self.print_explainable_report()
+
+        # 5. Output Logic
         print("\n" + "="*60)
         print(f"PORTFOLIO RISK STATE: {color}")
         print("="*60)
-        
+
+        print("-" * 30)
+        for entry in trace:
+            print(f"{entry}")
+        print("-" * 30)
+
         # Scenario output
         print(f"\n--- Scenario Stress Tests ---")
         for name, data in scenarios.items():
-            print(f"{name}: ")
-            print(f"  Details: {data['description']}")
-            print(f"  Projected Impact: ${data['loss']:,.2f}")
+            print(f"{name}:")
+            print(f"  Description: {data['description']}")
+            # OUTPUTTING PERCENTAGE LOSS HERE
+            print(f"  Projected Impact: ${data['loss']:,.2f} ({data['loss_pct']:.2f}%)")
             print("-" * 30)
-            
-        # 5. Explainability (Trace)
-        self.print_explainable_report(color, trace)
 
-        # 6. Mitigation (Passing evaluated parameters)
+        # 6. Mitigation
         if color != "GREEN":
-            print("\n--- AUTOMATED RISK MITIGATION ---")
-            # PASSING TRACE AND RULE_ID HERE
+            print("\n--- Automated Risk Mitigation ---")
             culprit, advice = self.risk_mitigation(rule_id)
             print(advice)
             
-        print("="*60 + "\n")
+        print("="*120 + "\n")
 
-    def print_explainable_report(self, color, trace):
+    def print_explainable_report(self):
         """
-        Outputs the 'Trace' for human auditors.
+        Provides a clear summary of the VaR calculation and an overview
+        of the other risk thresholds evaluated by the system.
         """
-        print(f"\nFINAL SYSTEM STATE: {color}")
-        print("-" * 30)
-        for entry in trace:
-            print(f"TRACER: {entry}")
-            
-        print("\nEXPLAINABILITY NOTE:")
-        print("(a) WHAT: This system uses a Hybrid Rule-Based model.")
-        print("(b) HOW: Rules check VaR (Parametric) and Concentration against thresholds.")
-        print("(c) WHY: Ensures the portfolio remains within user-defined thresholds.")
+        print(f"\n" + "="*60)
+        print("RISK METHODOLOGY SUMMARY")
+        print("="*60)
+
+        # 1. Simple VaR Summary
+        print("This program calculates a 5-Day Value at Risk (VaR), taking into account changes to foreign exchange rates for stocks in currencies not held natively.")
+        print("VaR estimates the 'worst-case' loss you could expect over the next week with 95% certainty. It looks at how volatile your stocks are")
+        print("and how they move together. If your stocks tend to drop at the same time, the VaR increases, signaling a lack of diversification.")
+
+        # 2. Overview of other checks
+        print(f"The system compares the calculated VaR against a {self.VaR_threshold*100:.0f}% risk threshold. ")
+        print("An alert is issued if your portfolio VaR is beyond or close to this threshold, and suggested trades are given that would mitigate risk.")
+        print("Two other thresholds are defined and used in this system: ")
+        print(f"    • small_cap_threshold: the percentage of smaller, volatile firms is capped at {self.small_cap_threshold*100:.0f}% before an alert is given.")
+        print(f"    • fx_threshold: the percentage of stocks in foreign currencies you don't hold is limited to {self.fx_threshold*100:.0f}% before an alert is given.")
+        print("Other than comparing risk thresholds, a number of scenarios are also run to give a summary of how your portfolio would fare under potential market crashes \nor localized economic changes.")
 
 
 if __name__ == "__main__":
@@ -373,7 +408,7 @@ if __name__ == "__main__":
         'PBR': (0.15, 'BRL'),
         '7203.T': (0.15, 'JPY')
     }
-    engine_1 = RiskManagementSystem(portfolio=portfolio_1, currencies=['USD', 'EUR'], total_value=250000, threshold=10)
+    engine_1 = RiskManagementSystem(portfolio=portfolio_1, currencies=['USD', 'EUR'], total_value=250000)
     engine_1.generate_heatmap()
 
     # Test Portfolio 2: 50% Apple, 15% Tesla, 20% REPX, 15% SHIP with threshold as 10% to trigger small caps concentration alert
@@ -383,13 +418,13 @@ if __name__ == "__main__":
         'REPX': (0.2, 'USD'),
         'SHIP': (0.15, 'USD')
     }
-    engine_2 = RiskManagementSystem(portfolio=portfolio_2, currencies=['USD'], total_value=250000, threshold=10)
-    engine_2.generate_heatmap()
+    engine_2 = RiskManagementSystem(portfolio=portfolio_2, currencies=['USD'], total_value=250000)
+    engine_2.generate_heatmap(print_explanation=False)
 
     # Test Portfolio 3: 50% Apple, 50% 7203.T (in JPY) with threshold as 10% to trigger international currency concentration alert
     portfolio_3 = {
         'AAPL': (0.5, 'USD'),
         '7203.T': (0.5, 'JPY')
     }
-    engine_3 = RiskManagementSystem(portfolio=portfolio_3, currencies=['USD'], total_value=250000, threshold=10)
-    engine_3.generate_heatmap()
+    engine_3 = RiskManagementSystem(portfolio=portfolio_3, currencies=['USD'], total_value=250000)
+    engine_3.generate_heatmap(print_explanation=False)
